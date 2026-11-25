@@ -6,7 +6,7 @@ dist/
 coverage/
 contracts/out/
 contracts/cache/
-contracts/broadcast/*/31337/
+contracts/broadcast/
 # environment
 .env
 .env.*
@@ -16,3 +16,4 @@ contracts/broadcast/*/31337/
 Thumbs.db
 .vscode/
 .idea/
+contracts/mutation_campaign/
