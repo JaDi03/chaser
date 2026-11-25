@@ -1,0 +1,24 @@
+{
+  "name": "Unichain Sepolia",
+  "chainId": 1301,
+  "rpcUrl": "https://sepolia.unichain.org",
+  "explorer": "https://sepolia.uniscan.xyz",
+  "uniswap": {
+    "poolManager": "0x00b036b58a818b1bc34d502d3fe730db729e62ac",
+    "positionManager": "0xf969aee60879c54baaed9f3ed26147db216fd664",
+    "stateView": "0xc199f1072a74d4e905aba1a84d9a45e2546b6222",
+    "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+  },
+  "reactive": {
+    "chainId": 5318007,
+    "rpcUrl": "https://lasna-rpc.rnk.dev/",
+    "explorer": null,
+    "systemContract": "0x8888888888888888888888888888888888888888",
+    "callbackProxy": "0x775c9B990ADe401060B78D0e98684eEf8d2466C1"
+  },
+  "chaser": {
+    "factory": null,
+    "reactive": null,
+    "pools": []
+  }
+}
