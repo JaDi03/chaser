@@ -19,6 +19,19 @@
   "chaser": {
     "factory": null,
     "reactive": null,
-    "pools": []
+    "pools": [],
+    "params": {
+      "fee": 3000,
+      "tickSpacing": 60,
+      "widthTicks": 960,
+      "triggerTicks": 960,
+      "cooldownSeconds": 60,
+      "callbackGasLimit": 1000000,
+      "pendingTimeoutSeconds": 300,
+      "callbackReserveWei": "2000000000000000",
+      "reactiveFundingWei": "5000000000000000000",
+      "confirmSeconds": 60,
+      "maxDeviationTicks": 240
+    }
   }
 }
