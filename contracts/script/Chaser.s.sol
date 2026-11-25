@@ -14,26 +14,21 @@ import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "v4-core/test/PoolModifyLiquidityTest.sol";
-import {LiquidityAmounts} from "v4-periphery/libraries/LiquidityAmounts.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
-import {ChaserVault} from "../src/ChaserVault.sol";
+import {ChaserFactory} from "../src/ChaserFactory.sol";
 import {ChaserReactive} from "../src/ChaserReactive.sol";
 import {TestToken} from "../src/test-utils/TestToken.sol";
 
-interface IDeposit {
-    function depositTo(address contract_) external payable;
-}
-
-/// @notice Gate 1 deployment on testnet, in this order (each step prints what the next one needs):
-/// 1. pool()                               --rpc-url <destination>  test tokens, pool, background liquidity, swapper
-/// 2. reactive(bytes32 poolId)             --rpc-url lasna          reactive contract, funded with REACT reserves
-/// 3. vault(address rc, address t0, address t1)  --rpc-url <destination>  vault and its callback reserve
-/// 4. linkVault(address rc, address vault) --rpc-url lasna          the reactive contract starts watching the vault
-/// 5. open(address vault)                  --rpc-url <destination>  opens the position (emits the first RangeMoved)
-/// Step 5 must run after step 4 is final on Lasna: the reactive contract learns the range only from a RangeMoved it
-/// is already subscribed to. Run every step with --sender set to the signing account: it becomes the owner.
-/// Every per-network value is read from config/networks/<NETWORK>.json.
-contract Gate1 is Script {
+/// @notice Testnet deployment, in this order (each step prints what the next one needs):
+/// 1. pool()                         --rpc-url <destination>  optional: new test tokens, pool, liquidity, swapper
+/// 2. reactive()                     --rpc-url lasna          the pool's shared reactive contract, funded with REACT
+/// 3. factory(address rc)            --rpc-url <destination>  the factory for the pool in the config
+/// 4. linkFactory(address rc, address factory) --rpc-url lasna  the reactive contract starts watching the factory
+/// 5. create(address factory)        --rpc-url <destination>  optional: a demo vault with test tokens
+/// Step 5 must run after step 4 is final on Lasna: the reactive contract learns vaults only from the factory's
+/// VaultCreated events it is already subscribed to. Run every step with --sender set to the signing account.
+/// Every per-network value is read from config/networks/<NETWORK>.json (`chaser.pool` and `chaser.params`).
+contract Chaser is Script {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
@@ -69,68 +64,70 @@ contract Gate1 is Script {
         console.logBytes32(PoolId.unwrap(key.toId()));
     }
 
-    function reactive(bytes32 poolId) external {
+    function reactive() external {
+        PoolKey memory key = _poolKey();
         vm.startBroadcast();
         // funded as its own balance (not system reserves) so the owner can take what is left with withdrawFunds
         ChaserReactive rc = new ChaserReactive{value: vm.parseJsonUint(cfg, ".chaser.params.reactiveFundingWei")}(
             vm.parseJsonUint(cfg, ".chainId"),
             _addr(".uniswap.poolManager"),
-            poolId,
-            _int24(".chaser.params.triggerTicks"),
+            PoolId.unwrap(key.toId()),
             uint64(vm.parseJsonUint(cfg, ".chaser.params.callbackGasLimit")),
             vm.parseJsonUint(cfg, ".chaser.params.pendingTimeoutSeconds"),
-            vm.parseJsonUint(cfg, ".chaser.params.confirmSeconds")
+            vm.parseJsonUint(cfg, ".chaser.params.confirmSeconds"),
+            vm.parseJsonUint(cfg, ".chaser.params.maxVaults")
         );
         require(rc.owner() == msg.sender, "owner is not the sender");
         vm.stopBroadcast();
         console.log("reactive", address(rc));
     }
 
-    function vault(address rc, address t0, address t1) external {
+    function factory(address rc) external {
+        ChaserFactory.PoolConfig[] memory pools = new ChaserFactory.PoolConfig[](1);
+        pools[0] = ChaserFactory.PoolConfig({
+            key: _poolKey(),
+            reactive: rc,
+            widthTicks: _int24(".chaser.params.widthTicks"),
+            maxDeviationTicks: _int24(".chaser.params.maxDeviationTicks"),
+            cooldownSeconds: vm.parseJsonUint(cfg, ".chaser.params.cooldownSeconds"),
+            maxVaults: vm.parseJsonUint(cfg, ".chaser.params.maxVaults"),
+            reserveWei: vm.parseJsonUint(cfg, ".chaser.params.callbackReserveWei"),
+            minLiquidity: uint128(vm.parseJsonUint(cfg, ".chaser.params.minLiquidity"))
+        });
         vm.startBroadcast();
-        ChaserVault v = new ChaserVault(
+        ChaserFactory f = new ChaserFactory(
             IPayable(payable(_addr(".reactive.callbackProxy"))),
-            rc,
             IPositionManager(_addr(".uniswap.positionManager")),
             IAllowanceTransfer(_addr(".uniswap.permit2")),
-            _key(t0, t1),
-            msg.sender,
-            _int24(".chaser.params.triggerTicks"),
-            _int24(".chaser.params.maxDeviationTicks"),
-            vm.parseJsonUint(cfg, ".chaser.params.cooldownSeconds")
-        );
-        require(v.owner() == msg.sender, "owner is not the sender");
-        IDeposit(_addr(".reactive.callbackProxy"))
-        .depositTo{value: vm.parseJsonUint(cfg, ".chaser.params.callbackReserveWei")}(
-            address(v)
+            pools
         );
         vm.stopBroadcast();
-        console.log("vault", address(v));
+        console.log("factory", address(f));
     }
 
-    function linkVault(address rc, address v) external {
+    function linkFactory(address rc, address f) external {
         vm.startBroadcast();
-        ChaserReactive(payable(rc)).setVault(v);
+        ChaserReactive(payable(rc)).setFactory(f);
         vm.stopBroadcast();
     }
 
-    function open(address v) external {
-        ChaserVault cv = ChaserVault(payable(v));
-        PoolKey memory key = cv.poolKey();
-        IPoolManager manager = cv.poolManager();
-        int24 half = _int24(".chaser.params.widthTicks") / 2;
-        (uint160 sqrtPrice, int24 tick,,) = manager.getSlot0(key.toId());
-        int24 lower = (tick / key.tickSpacing) * key.tickSpacing - half;
-        int24 upper = lower + 2 * half;
+    function create(address f) external {
+        ChaserFactory cf = ChaserFactory(f);
+        PoolKey memory key = _poolKey();
+        (, int24 tick,,) = cf.poolManager().getSlot0(key.toId());
         uint128 amount = 10e18;
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPrice, TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), amount, amount
-        );
         vm.startBroadcast();
-        TestToken(Currency.unwrap(key.currency0)).approve(v, amount);
-        TestToken(Currency.unwrap(key.currency1)).approve(v, amount);
-        cv.open(lower, upper, liquidity, amount, amount);
+        TestToken(Currency.unwrap(key.currency0)).approve(f, amount);
+        TestToken(Currency.unwrap(key.currency1)).approve(f, amount);
+        address v = cf.create{value: vm.parseJsonUint(cfg, ".chaser.params.callbackReserveWei")}(
+            key.toId(), amount, amount, tick, key.tickSpacing
+        );
         vm.stopBroadcast();
+        console.log("vault", v);
+    }
+
+    function _poolKey() internal view returns (PoolKey memory) {
+        return _key(_addr(".chaser.pool.token0"), _addr(".chaser.pool.token1"));
     }
 
     function _key(address t0, address t1) internal view returns (PoolKey memory) {
