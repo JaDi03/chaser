@@ -19,6 +19,6 @@
   "chaser": {
     "factory": null,
     "reactive": null,
-    "pools": []
+    "pool": null
   }
 }

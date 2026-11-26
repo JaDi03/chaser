@@ -19,7 +19,12 @@
   "chaser": {
     "factory": null,
     "reactive": null,
-    "pools": [],
+    "pool": {
+      "token0": "0xB44D2050E42ed0b153d349e7a20F68cf0a282553",
+      "token1": "0xe92e0661AA346E48A44d2bA929cDE8c964A4Ae9f",
+      "poolId": "0x1fc7cf63ceb382ed71e73b57ec4fb18485a8485ef76f397083d3d579fe99fbf1",
+      "swapper": "0x7c6890583abDf86E39303015d0D4e79ccE980157"
+    },
     "gate1": {
       "reactive": "0xB44D2050E42ed0b153d349e7a20F68cf0a282553",
       "vault": "0x3A102Bea829B6Db29F869eC8D5397608f7A778fc",
@@ -33,8 +38,9 @@
       "fee": 3000,
       "tickSpacing": 60,
       "widthTicks": 960,
-      "triggerTicks": 960,
       "cooldownSeconds": 60,
+      "maxVaults": 30,
+      "minLiquidity": "1000000000000000000",
       "callbackGasLimit": 1000000,
       "pendingTimeoutSeconds": 300,
       "callbackReserveWei": "2000000000000000",

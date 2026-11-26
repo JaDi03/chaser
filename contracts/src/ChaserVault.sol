@@ -17,10 +17,17 @@ import {ERC20} from "solmate/src/tokens/ERC20.sol";
 import {SafeTransferLib} from "solmate/src/utils/SafeTransferLib.sol";
 import {ReentrancyGuard} from "solmate/src/utils/ReentrancyGuard.sol";
 
+/// @notice What a vault reports to its factory; the factory republishes it as one event stream per pool.
+interface IVaultFactory {
+    function vaultMoved(int24 tickLower, int24 tickUpper) external;
+    function vaultPaused(bool paused) external;
+    function vaultClosed() external;
+}
+
 /// @title ChaserVault
-/// @notice Holds one owner's Uniswap v4 position. When a trend leaves the range behind (the price is past an edge by
-/// `triggerTicks`), a Reactive callback moves the single token the position holds into a range of the same width
-/// next to the price. The vault never swaps.
+/// @notice Holds one owner's Uniswap v4 position, created by the ChaserFactory. When a trend leaves the range behind
+/// (the price is past an edge by one full range width), a Reactive callback moves the single token the position holds
+/// into a range of the same width next to the price. The vault never swaps. After `withdraw` it is closed for good.
 contract ChaserVault is AbstractCallback, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -36,22 +43,27 @@ contract ChaserVault is AbstractCallback, ReentrancyGuard {
     }
 
     error NotOwner();
+    error NotFactory();
     error InvalidParams();
-    error PositionAlreadyOpen();
+    error AlreadyOpened();
     error NothingToMove();
+    error PauseTooSoon();
 
     event RangeMoved(uint256 indexed tokenId, int24 tickLower, int24 tickUpper, int24 tick, uint128 liquidity);
     event RebalanceSkipped(Skip reason, int24 tick);
     event Withdrawn(uint256 amount0, uint256 amount1, uint256 amountNative);
+    event Closed(address indexed to);
     event PausedSet(bool paused);
 
     int24 public constant MAX_TRIGGER_TICKS = 200_000;
     uint256 public constant MAX_COOLDOWN_SECONDS = 30 days;
+    /// @notice Each pause change costs the shared reactive contract one reaction, so changes are spaced out.
+    uint256 public constant MIN_PAUSE_INTERVAL = 10 minutes;
 
     address public immutable owner;
+    IVaultFactory public immutable factory;
     IPositionManager public immutable positionManager;
     IPoolManager public immutable poolManager;
-    int24 public immutable triggerTicks;
     int24 public immutable maxDeviationTicks;
     uint256 public immutable cooldownSeconds;
     Currency public immutable currency0;
@@ -64,12 +76,22 @@ contract ChaserVault is AbstractCallback, ReentrancyGuard {
     int24 public tickUpper;
     uint256 public lastMoveAt;
     bool public paused;
+    bool public closed;
+    uint256 public lastPauseChangeAt;
+    /// @notice Distance past an edge that triggers a move: the range width, fixed when the position opens.
+    int24 public triggerTicks;
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
         _;
     }
 
+    modifier onlyFactory() {
+        if (msg.sender != address(factory)) revert NotFactory();
+        _;
+    }
+
+    /// @dev Deployed by the factory, which becomes the only account allowed to open the position.
     constructor(
         IPayable callbackProxy_,
         address reactiveContract_,
@@ -77,7 +99,6 @@ contract ChaserVault is AbstractCallback, ReentrancyGuard {
         IAllowanceTransfer permit2_,
         PoolKey memory poolKey_,
         address owner_,
-        int24 triggerTicks_,
         int24 maxDeviationTicks_,
         uint256 cooldownSeconds_
     ) AbstractCallback(callbackProxy_, reactiveContract_) {
@@ -87,15 +108,13 @@ contract ChaserVault is AbstractCallback, ReentrancyGuard {
                 || Currency.unwrap(poolKey_.currency0).code.length == 0
                 || Currency.unwrap(poolKey_.currency1).code.length == 0
         ) revert InvalidParams();
-        // a trigger below one tick spacing would recreate the same range
         if (
-            triggerTicks_ < poolKey_.tickSpacing || triggerTicks_ > MAX_TRIGGER_TICKS || maxDeviationTicks_ <= 0
-                || maxDeviationTicks_ > MAX_TRIGGER_TICKS || cooldownSeconds_ > MAX_COOLDOWN_SECONDS
+            maxDeviationTicks_ <= 0 || maxDeviationTicks_ > MAX_TRIGGER_TICKS || cooldownSeconds_ > MAX_COOLDOWN_SECONDS
         ) revert InvalidParams();
         owner = owner_;
+        factory = IVaultFactory(msg.sender);
         positionManager = positionManager_;
         poolManager = positionManager_.poolManager();
-        triggerTicks = triggerTicks_;
         maxDeviationTicks = maxDeviationTicks_;
         cooldownSeconds = cooldownSeconds_;
         currency0 = poolKey_.currency0;
@@ -112,21 +131,24 @@ contract ChaserVault is AbstractCallback, ReentrancyGuard {
         return _poolKey;
     }
 
-    /// @notice Opens the position with the owner's tokens; anything not used goes back to the owner.
+    /// @notice Opens the position once, with the owner's tokens the factory already moved here; anything not used goes
+    /// back to the owner.
     function open(int24 tickLower_, int24 tickUpper_, uint128 liquidity, uint128 amount0Max, uint128 amount1Max)
         external
         nonReentrant
-        onlyOwner
+        onlyFactory
     {
-        if (tokenId != 0) revert PositionAlreadyOpen();
+        if (triggerTicks != 0) revert AlreadyOpened();
+        int256 width = int256(tickUpper_) - int256(tickLower_);
+        // the price tolerance must stay below the move distance, or a pushed price could pass as the confirmed one
         if (
-            tickLower_ >= tickUpper_ || tickLower_ % tickSpacing != 0 || tickUpper_ % tickSpacing != 0
-                || tickLower_ < TickMath.minUsableTick(tickSpacing) || tickUpper_ > TickMath.maxUsableTick(tickSpacing)
-                || liquidity == 0
+            width <= 0 || width > MAX_TRIGGER_TICKS || width < maxDeviationTicks || tickLower_ % tickSpacing != 0
+                || tickUpper_ % tickSpacing != 0 || tickLower_ < TickMath.minUsableTick(tickSpacing)
+                || tickUpper_ > TickMath.maxUsableTick(tickSpacing) || liquidity == 0
         ) revert InvalidParams();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        triggerTicks = int24(width);
 
-        ERC20(Currency.unwrap(currency0)).safeTransferFrom(msg.sender, address(this), amount0Max);
-        ERC20(Currency.unwrap(currency1)).safeTransferFrom(msg.sender, address(this), amount1Max);
         _mint(tickLower_, tickUpper_, liquidity, amount0Max, amount1Max);
         _sendAll(owner);
     }
@@ -142,6 +164,11 @@ contract ChaserVault is AbstractCallback, ReentrancyGuard {
         onlyCallbackSender(rvmId)
     {
         (, int24 tick,,) = poolManager.getSlot0(_poolKey.toId());
+        if (closed) {
+            // the reactive contract still watches a closed vault: report the closing again so it stops
+            factory.vaultClosed();
+            return _skip(Skip.NoPosition, tick);
+        }
         if (paused) return _skip(Skip.Paused, tick);
         if (tokenId == 0) return _skip(Skip.NoPosition, tick);
         if (block.timestamp < lastMoveAt + cooldownSeconds) return _skip(Skip.CoolingDown, tick);
@@ -189,24 +216,39 @@ contract ChaserVault is AbstractCallback, ReentrancyGuard {
         if (liquidity == 0) revert NothingToMove();
         // the new range is computed from this same price, so it needs only the token the position holds
         _mint(newLower, newUpper, liquidity, amount0Max, amount1Max);
+        factory.vaultMoved(newLower, newUpper);
     }
 
-    /// @notice Closes the position and sends both tokens and any native balance to the owner. Works while paused and
-    /// without Reactive. If the owner refuses native currency, the tokens still leave and the native balance stays.
-    function withdraw() external nonReentrant onlyOwner {
+    /// @notice Closes the position for good and sends both tokens and any native balance to `to`. Works while paused
+    /// and without Reactive. Can be called again to sweep anything sent later. If `to` refuses native currency, the
+    /// tokens still leave and the native balance stays.
+    function withdraw(address to) external nonReentrant onlyOwner {
+        if (to == address(0)) revert InvalidParams();
         if (tokenId != 0) _burn();
-        (uint256 amount0, uint256 amount1) = _sendAll(owner);
+        if (!closed) {
+            closed = true;
+            factory.vaultClosed();
+            emit Closed(to);
+        }
+        (uint256 amount0, uint256 amount1) = _sendAll(to);
         uint256 amountNative = address(this).balance;
         if (amountNative > 0) {
-            // an owner that refuses native currency must still get its tokens: the native balance then stays here
-            (bool ok,) = payable(owner).call{value: amountNative}("");
+            // a receiver that refuses native currency must still get the tokens: the native balance then stays here
+            (bool ok,) = payable(to).call{value: amountNative}("");
             if (!ok) amountNative = 0;
         }
         emit Withdrawn(amount0, amount1, amountNative);
     }
 
+    /// @notice Pauses or resumes the automation. `withdraw` works either way. Changes are at least
+    /// `MIN_PAUSE_INTERVAL` apart; setting the current value does nothing.
     function setPaused(bool paused_) external onlyOwner {
+        if (closed) revert InvalidParams();
+        if (paused_ == paused) return;
+        if (lastPauseChangeAt != 0 && block.timestamp < lastPauseChangeAt + MIN_PAUSE_INTERVAL) revert PauseTooSoon();
         paused = paused_;
+        lastPauseChangeAt = block.timestamp;
+        factory.vaultPaused(paused_);
         emit PausedSet(paused_);
     }
 

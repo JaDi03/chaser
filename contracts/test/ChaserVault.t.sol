@@ -1,81 +1,39 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import {Test} from "forge-std/Test.sol";
 import {IPayable} from "reactive-lib/interfaces/IPayable.sol";
 import {AbstractPayer} from "reactive-lib/base/AbstractPayer.sol";
 import {AbstractCallback} from "reactive-lib/base/AbstractCallback.sol";
-import {IPositionManager} from "v4-periphery/interfaces/IPositionManager.sol";
-import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {Currency} from "v4-core/types/Currency.sol";
-import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
-import {TickMath} from "v4-core/libraries/TickMath.sol";
-import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
-import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
-import {PoolModifyLiquidityTest} from "v4-core/test/PoolModifyLiquidityTest.sol";
-import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {IERC721} from "forge-std/interfaces/IERC721.sol";
-import {ChaserVault} from "../src/ChaserVault.sol";
-import {ChaserReactive} from "../src/ChaserReactive.sol";
-import {IReactive} from "reactive-lib/interfaces/IReactive.sol";
-import {MockSystem} from "./mocks/MockSystem.sol";
 import {Vm} from "forge-std/Vm.sol";
-import {TestToken} from "../src/test-utils/TestToken.sol";
+import {IReactive} from "reactive-lib/interfaces/IReactive.sol";
+import {ChaserVault} from "../src/ChaserVault.sol";
+import {ChaserFactory} from "../src/ChaserFactory.sol";
+import {ChaserReactive} from "../src/ChaserReactive.sol";
+import {MockSystem} from "./mocks/MockSystem.sol";
+import {ForkBase} from "./utils/ForkBase.sol";
 
-/// Runs against the official Uniswap v4 contracts on a pinned Unichain Sepolia fork.
-contract ChaserVaultForkTest is Test {
+/// Runs against the official Uniswap v4 contracts on a pinned Unichain Sepolia fork; the vault is made by the factory.
+contract ChaserVaultForkTest is ForkBase {
     using PoolIdLibrary for PoolKey;
-    using StateLibrary for IPoolManager;
 
-    uint256 internal constant FORK_BLOCK = 68_778_100;
-    int24 internal constant SPACING = 60;
-    int24 internal constant LOWER = -480;
-    int24 internal constant UPPER = 480;
-    int24 internal constant TRIGGER = 960;
-    uint256 internal constant COOLDOWN = 60;
-    int24 internal constant DEVIATION = 240;
-
-    IPositionManager internal posm;
-    IPoolManager internal manager;
-    IAllowanceTransfer internal permit2;
-    address internal proxy;
-    address internal rc = makeAddr("reactiveContract");
-    address internal owner = makeAddr("owner");
-    PoolKey internal key;
-    PoolSwapTest internal swapper;
     ChaserVault internal vault;
-    TestToken internal token0;
-    TestToken internal token1;
 
     function setUp() public {
-        string memory cfg = vm.readFile(string.concat(vm.projectRoot(), "/../config/networks/unichain-sepolia.json"));
-        vm.createSelectFork(vm.parseJsonString(cfg, ".rpcUrl"), FORK_BLOCK);
-        posm = IPositionManager(vm.parseJsonAddress(cfg, ".uniswap.positionManager"));
-        permit2 = IAllowanceTransfer(vm.parseJsonAddress(cfg, ".uniswap.permit2"));
-        proxy = vm.parseJsonAddress(cfg, ".reactive.callbackProxy");
-        manager = posm.poolManager();
-        assertEq(address(manager), vm.parseJsonAddress(cfg, ".uniswap.poolManager"));
-
-        TestToken a = new TestToken("Test A", "TA", 18);
-        TestToken b = new TestToken("Test B", "TB", 18);
-        (token0, token1) = address(a) < address(b) ? (a, b) : (b, a);
-        key = PoolKey(Currency.wrap(address(token0)), Currency.wrap(address(token1)), 3000, SPACING, IHooks(address(0)));
-        manager.initialize(key, TickMath.getSqrtPriceAtTick(0));
-
-        // background liquidity so swaps can move the price across a wide band
-        PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(manager);
-        _fundAndApprove(address(this), address(lp), 1e30);
-        lp.modifyLiquidity(key, ModifyLiquidityParams(-60_000, 60_000, 1e21, 0), "");
-        swapper = new PoolSwapTest(manager);
-        _fundAndApprove(address(this), address(swapper), 0);
-
-        vault = new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, owner, TRIGGER, DEVIATION, COOLDOWN);
-        _open(10e18, 10e18);
+        _setUpFork();
+        vault = _create(owner, 10e18, 10e18);
     }
+
+    /// Lets this test contract stand in as the factory of vaults it deploys directly.
+    function vaultClosed() external {}
+
+    function vaultMoved(int24, int24) external {}
+
+    function vaultPaused(bool) external {}
 
     function test_openMintsPositionAndRefundsTheRest() public view {
         assertGt(vault.tokenId(), 0);
@@ -83,6 +41,9 @@ contract ChaserVaultForkTest is Test {
         assertGt(posm.getPositionLiquidity(vault.tokenId()), 0);
         assertEq(token0.balanceOf(address(vault)), 0);
         assertEq(token1.balanceOf(address(vault)), 0);
+        assertEq(vault.triggerTicks(), WIDTH);
+        assertEq(vault.owner(), owner);
+        assertEq(address(vault.factory()), address(factory));
     }
 
     function test_rebalanceOnlyFromProxyAndOurReactiveContract() public {
@@ -96,7 +57,7 @@ contract ChaserVaultForkTest is Test {
     }
 
     function test_skipsInsideTrigger() public {
-        _moveTo(UPPER + TRIGGER - 120);
+        _moveTo(UPPER + WIDTH - 120);
         uint256 id = vault.tokenId();
         vm.expectEmit(address(vault));
         emit ChaserVault.RebalanceSkipped(ChaserVault.Skip.InsideTrigger, _tick());
@@ -105,33 +66,33 @@ contract ChaserVaultForkTest is Test {
     }
 
     function test_movesBelowThePriceAfterATrendUp() public {
-        _moveTo(UPPER + TRIGGER + 300);
+        _moveTo(UPPER + WIDTH + 300);
         int24 tick = _tick();
         _rebalance();
 
-        assertEq(vault.tickUpper() - vault.tickLower(), UPPER - LOWER);
+        assertEq(vault.tickUpper() - vault.tickLower(), WIDTH);
         assertLe(vault.tickUpper(), tick);
         assertGt(vault.tickUpper(), tick - SPACING);
         _assertSingleToken(false);
     }
 
     function test_movesAboveThePriceAfterATrendDown() public {
-        _moveTo(LOWER - TRIGGER - 300);
+        _moveTo(LOWER - WIDTH - 300);
         int24 tick = _tick();
         _rebalance();
 
-        assertEq(vault.tickUpper() - vault.tickLower(), UPPER - LOWER);
+        assertEq(vault.tickUpper() - vault.tickLower(), WIDTH);
         assertGt(vault.tickLower(), tick);
         assertLe(vault.tickLower(), tick + SPACING);
         _assertSingleToken(true);
     }
 
     function test_neverSwaps() public {
-        _moveTo(UPPER + TRIGGER + 300);
-        (uint256 before0, uint256 before1) = _amounts();
+        _moveTo(UPPER + WIDTH + 300);
+        (uint256 before0, uint256 before1) = _amountsOf(vault);
         assertEq(before0, 0);
         _rebalance();
-        (uint256 after0,) = _amounts();
+        (uint256 after0,) = _amountsOf(vault);
         // all token1 is still held (plus fees), and no token1 became token0: token0 is only fees in the vault
         assertGe(_held1() + 10, before1);
         assertEq(after0, 0);
@@ -139,9 +100,9 @@ contract ChaserVaultForkTest is Test {
     }
 
     function test_cooldownBlocksASecondMove() public {
-        _moveTo(UPPER + TRIGGER + 300);
+        _moveTo(UPPER + WIDTH + 300);
         _rebalance();
-        _moveTo(vault.tickUpper() + TRIGGER + 300);
+        _moveTo(vault.tickUpper() + WIDTH + 300);
         uint256 id = vault.tokenId();
         vm.expectEmit(address(vault));
         emit ChaserVault.RebalanceSkipped(ChaserVault.Skip.CoolingDown, _tick());
@@ -155,46 +116,131 @@ contract ChaserVaultForkTest is Test {
     function test_pausedSkipsButWithdrawStillWorks() public {
         vm.prank(owner);
         vault.setPaused(true);
-        _moveTo(UPPER + TRIGGER + 300);
+        _moveTo(UPPER + WIDTH + 300);
         uint256 id = vault.tokenId();
         _rebalance();
         assertEq(vault.tokenId(), id);
 
         vm.prank(owner);
-        vault.withdraw();
+        vault.withdraw(owner);
         assertEq(vault.tokenId(), 0);
         assertGt(token1.balanceOf(owner), 0);
         assertEq(token0.balanceOf(address(vault)), 0);
         assertEq(token1.balanceOf(address(vault)), 0);
     }
 
-    function test_onlyOwnerCanWithdrawPauseOpen() public {
+    function test_onlyOwnerCanWithdrawAndPause() public {
         address stranger = makeAddr("stranger");
         vm.startPrank(stranger);
         vm.expectRevert(ChaserVault.NotOwner.selector);
-        vault.withdraw();
+        vault.withdraw(stranger);
         vm.expectRevert(ChaserVault.NotOwner.selector);
         vault.setPaused(true);
-        vm.expectRevert(ChaserVault.NotOwner.selector);
-        vault.open(LOWER, UPPER, 1, 1, 1);
         vm.stopPrank();
+    }
+
+    function test_onlyTheFactoryOpensAndOnlyOnce() public {
+        vm.prank(owner);
+        vm.expectRevert(ChaserVault.NotFactory.selector);
+        vault.open(LOWER, UPPER, 1, 0, 0);
+        vm.prank(address(factory));
+        vm.expectRevert(ChaserVault.AlreadyOpened.selector);
+        vault.open(LOWER, UPPER, 1, 0, 0);
+    }
+
+    // F5: a pause change is reported to the factory once; repeats do nothing and changes are spaced out
+    function test_pauseIsReportedOnceAndSpacedOut() public {
+        vm.startPrank(owner);
+        vm.expectEmit(address(factory));
+        emit ChaserFactory.VaultPaused(poolId, address(vault), true);
+        vault.setPaused(true);
+        vm.recordLogs();
+        vault.setPaused(true);
+        assertEq(vm.getRecordedLogs().length, 0);
+        vm.expectRevert(ChaserVault.PauseTooSoon.selector);
+        vault.setPaused(false);
+        vm.warp(block.timestamp + vault.MIN_PAUSE_INTERVAL());
+        vault.setPaused(false);
+        assertFalse(vault.paused());
+        vm.stopPrank();
+    }
+
+    function test_movesAreReportedToTheFactory() public {
+        _moveTo(UPPER + WIDTH + 300);
+        vm.recordLogs();
+        _rebalance();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 topic = keccak256("VaultMoved(bytes32,address,int24,int24)");
+        bool found;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].emitter != address(factory) || logs[i].topics[0] != topic) continue;
+            (int24 lower, int24 upper) = abi.decode(logs[i].data, (int24, int24));
+            assertEq(lower, vault.tickLower());
+            assertEq(upper, vault.tickUpper());
+            assertEq(address(uint160(uint256(logs[i].topics[2]))), address(vault));
+            found = true;
+        }
+        assertTrue(found);
+    }
+
+    // F1: a closed vault that still gets a callback makes the factory publish its closing again
+    function test_closedVaultReportsTheClosingAgainOnACallback() public {
+        vm.prank(owner);
+        vault.withdraw(owner);
+        vm.expectEmit(address(factory));
+        emit ChaserFactory.VaultClosed(poolId, address(vault));
+        _rebalance();
+        assertEq(factory.activeVaults(poolId), 0);
+    }
+
+    // A16: the owner chooses where the funds go
+    function test_withdrawToAnotherAddress() public {
+        address to = makeAddr("coldWallet");
+        vm.prank(owner);
+        vault.withdraw(to);
+        assertGt(token0.balanceOf(to), 0);
+        assertGt(token1.balanceOf(to), 0);
+        assertEq(token0.balanceOf(owner), 0);
+        vm.prank(owner);
+        vm.expectRevert(ChaserVault.InvalidParams.selector);
+        vault.withdraw(address(0));
+    }
+
+    function test_withdrawClosesForGood() public {
+        vm.prank(owner);
+        vault.withdraw(owner);
+        assertTrue(vault.closed());
+        assertEq(factory.activeVaults(poolId), 0);
+        vm.prank(owner);
+        vm.expectRevert(ChaserVault.InvalidParams.selector);
+        vault.setPaused(false);
+        // a second withdraw sweeps what arrived later and does not count the vault as closed twice
+        token1.mint(address(vault), 1e18);
+        vm.prank(owner);
+        vault.withdraw(owner);
+        assertEq(token1.balanceOf(address(vault)), 0);
+        assertEq(factory.activeVaults(poolId), 0);
+        // the factory refuses to open it again
+        vm.prank(address(factory));
+        vm.expectRevert(ChaserVault.AlreadyOpened.selector);
+        vault.open(LOWER, UPPER, 1, 0, 0);
     }
 
     function test_rejectsHookedPoolsAndTokensWithoutCode() public {
         PoolKey memory hooked = key;
         hooked.hooks = IHooks(address(0xB00C));
         vm.expectRevert(ChaserVault.InvalidParams.selector);
-        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, hooked, owner, TRIGGER, DEVIATION, COOLDOWN);
+        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, hooked, owner, DEVIATION, COOLDOWN);
 
         PoolKey memory noCode = key;
         noCode.currency1 = Currency.wrap(address(0xDEAD));
         vm.expectRevert(ChaserVault.InvalidParams.selector);
-        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, noCode, owner, TRIGGER, DEVIATION, COOLDOWN);
+        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, noCode, owner, DEVIATION, COOLDOWN);
     }
 
     // A1: a price pushed after the reactive contract confirmed its tick does not move the position
     function test_deviationSkipsAPushedPrice() public {
-        _moveTo(UPPER + TRIGGER + 300);
+        _moveTo(UPPER + WIDTH + 300);
         int24 confirmed = _tick();
         _moveTo(confirmed + 1000);
         uint256 id = vault.tokenId();
@@ -205,7 +251,7 @@ contract ChaserVaultForkTest is Test {
     }
 
     function test_deviationWithinToleranceStillMoves() public {
-        _moveTo(UPPER + TRIGGER + 300);
+        _moveTo(UPPER + WIDTH + 300);
         int24 confirmed = _tick();
         _moveTo(confirmed + DEVIATION - 10);
         uint256 id = vault.tokenId();
@@ -215,7 +261,7 @@ contract ChaserVaultForkTest is Test {
 
     // A9: the downside half of the rule
     function test_skipsInsideTriggerBelow() public {
-        _moveTo(LOWER - TRIGGER + 60);
+        _moveTo(LOWER - WIDTH + 60);
         uint256 id = vault.tokenId();
         vm.expectEmit(address(vault));
         emit ChaserVault.RebalanceSkipped(ChaserVault.Skip.InsideTrigger, _tick());
@@ -224,7 +270,7 @@ contract ChaserVaultForkTest is Test {
     }
 
     function test_negativeUnalignedTickAlignsTheNewRange() public {
-        _moveTo(LOWER - TRIGGER - 337);
+        _moveTo(LOWER - WIDTH - 337);
         int24 tick = _tick();
         assertTrue(tick % SPACING != 0);
         _rebalance();
@@ -233,45 +279,19 @@ contract ChaserVaultForkTest is Test {
         assertLe(vault.tickLower(), tick + SPACING);
     }
 
-    function test_secondOpenIsRefused() public {
-        vm.prank(owner);
-        vm.expectRevert(ChaserVault.PositionAlreadyOpen.selector);
-        vault.open(LOWER, UPPER, 1, 0, 0);
-    }
-
-    function test_openRefundsWhatIsNotUsed() public {
-        vm.prank(owner);
-        vault.withdraw();
-        uint256 before0 = token0.balanceOf(owner);
-        uint256 before1 = token1.balanceOf(owner);
-        (uint160 sqrtPrice,,,) = manager.getSlot0(key.toId());
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPrice, TickMath.getSqrtPriceAtTick(LOWER), TickMath.getSqrtPriceAtTick(UPPER), 1e18, 1e18
-        );
-        vm.startPrank(owner);
-        token0.approve(address(vault), 5e18);
-        token1.approve(address(vault), 5e18);
-        vault.open(LOWER, UPPER, liquidity, 5e18, 5e18);
-        vm.stopPrank();
-        assertGt(token0.balanceOf(owner), before0 - 5e18);
-        assertGt(token1.balanceOf(owner), before1 - 5e18);
-        assertEq(token0.balanceOf(address(vault)), 0);
-        assertEq(token1.balanceOf(address(vault)), 0);
-    }
-
     function test_withdrawSendsToken0AfterATrendDown() public {
-        _moveTo(LOWER - TRIGGER - 300);
+        _moveTo(LOWER - WIDTH - 300);
         _rebalance();
         uint256 before0 = token0.balanceOf(owner);
         vm.prank(owner);
-        vault.withdraw();
+        vault.withdraw(owner);
         assertGt(token0.balanceOf(owner), before0);
         assertEq(token0.balanceOf(address(vault)), 0);
     }
 
     function test_noPositionSkips() public {
         vm.prank(owner);
-        vault.withdraw();
+        vault.withdraw(owner);
         vm.expectEmit(address(vault));
         emit ChaserVault.RebalanceSkipped(ChaserVault.Skip.NoPosition, _tick());
         _rebalance();
@@ -285,7 +305,7 @@ contract ChaserVaultForkTest is Test {
         assertTrue(ok);
         uint256 before = owner.balance;
         vm.prank(owner);
-        vault.withdraw();
+        vault.withdraw(owner);
         assertEq(owner.balance, before + 1 ether);
         assertEq(address(vault).balance, 0);
     }
@@ -298,7 +318,7 @@ contract ChaserVaultForkTest is Test {
 
     // A4: a huge donation of the held token does not block moves; the excess stays and leaves with withdraw
     function test_hugeDonationDoesNotBlockMoves() public {
-        _moveTo(UPPER + TRIGGER + 300);
+        _moveTo(UPPER + WIDTH + 300);
         uint256 donation = uint256(type(uint128).max) + 1;
         token1.mint(address(vault), donation);
         uint256 id = vault.tokenId();
@@ -310,73 +330,84 @@ contract ChaserVaultForkTest is Test {
     // A6: parameters out of bounds are refused
     function test_constructorBounds() public {
         vm.expectRevert(ChaserVault.InvalidParams.selector);
-        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, owner, SPACING - 1, DEVIATION, COOLDOWN);
+        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, owner, 0, COOLDOWN);
         vm.expectRevert(ChaserVault.InvalidParams.selector);
-        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, owner, 200_001, DEVIATION, COOLDOWN);
+        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, owner, 200_001, COOLDOWN);
         vm.expectRevert(ChaserVault.InvalidParams.selector);
-        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, owner, TRIGGER, 0, COOLDOWN);
+        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, owner, DEVIATION, 30 days + 1);
         vm.expectRevert(ChaserVault.InvalidParams.selector);
-        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, owner, TRIGGER, DEVIATION, 30 days + 1);
-        vm.expectRevert(ChaserVault.InvalidParams.selector);
-        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, address(0), TRIGGER, DEVIATION, COOLDOWN);
+        new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, address(0), DEVIATION, COOLDOWN);
     }
 
-    // the reactive contract decodes the vault's real RangeMoved event
-    function test_reactiveContractReadsTheRealRangeMoved() public {
+    // D4: a price tolerance wider than the range is refused when the position opens
+    function test_openRefusesADeviationWiderThanTheRange() public {
+        ChaserVault v = new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, owner, 2 * WIDTH, COOLDOWN);
+        vm.expectRevert(ChaserVault.InvalidParams.selector);
+        v.open(LOWER, UPPER, 1, 0, 0);
+        vm.expectRevert(ChaserVault.InvalidParams.selector);
+        v.open(UPPER, LOWER, 1, 0, 0);
+    }
+
+    // the shared reactive contract learns the vault from the real VaultCreated and follows the real RangeMoved
+    function test_reactiveContractReadsTheRealEvents() public {
         vm.etch(0x8888888888888888888888888888888888888888, address(new MockSystem()).code);
         ChaserReactive reactive =
-            new ChaserReactive(block.chainid, address(manager), PoolId.unwrap(key.toId()), TRIGGER, 1_000_000, 300, 0);
-        reactive.setVault(address(vault));
+            new ChaserReactive(block.chainid, address(manager), PoolId.unwrap(poolId), 1_000_000, 300, 60, 10);
+        reactive.setFactory(address(factory));
 
-        _moveTo(UPPER + TRIGGER + 300);
         vm.recordLogs();
-        _rebalance();
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        bytes32 topic = keccak256("RangeMoved(uint256,int24,int24,int24,uint128)");
-        for (uint256 i; i < logs.length; i++) {
-            if (logs[i].emitter != address(vault) || logs[i].topics[0] != topic) continue;
-            IReactive.LogRecord memory log_;
-            log_.chainId = block.chainid;
-            log_.contractAddress = address(vault);
-            log_.topic0 = uint256(topic);
-            log_.topic1 = uint256(logs[i].topics[1]);
-            log_.data = logs[i].data;
-            vm.prank(0x8888888888888888888888888888888888888888);
-            reactive.react(log_);
-        }
-        assertEq(reactive.tickLower(), vault.tickLower());
-        assertEq(reactive.tickUpper(), vault.tickUpper());
+        ChaserVault v = _create(makeAddr("second"), 10e18, 10e18);
+        _forward(reactive, vm.getRecordedLogs());
+        ChaserReactive.Watch memory w = reactive.watchOf(address(v));
+        assertEq(w.tickLower, v.tickLower());
+        assertEq(w.tickUpper, v.tickUpper());
+
+        _moveTo(UPPER + WIDTH + 300);
+        int24 confirmed = _tick();
+        vm.recordLogs();
+        vm.prank(proxy);
+        v.rebalance(rc, confirmed);
+        _forward(reactive, vm.getRecordedLogs());
+        w = reactive.watchOf(address(v));
+        assertEq(w.tickLower, v.tickLower());
+        assertEq(w.tickUpper, v.tickUpper());
+
+        vm.recordLogs();
+        vm.prank(makeAddr("second"));
+        v.withdraw(makeAddr("second"));
+        _forward(reactive, vm.getRecordedLogs());
+        assertEq(reactive.watchOf(address(v)).slot, 0);
     }
 
     // D1: a stranger's wei cannot freeze the withdrawal of an owner that refuses native currency
     function test_withdrawWorksForAnOwnerThatRefusesNative() public {
         RefusesNative refuser = new RefusesNative();
-        ChaserVault v = new ChaserVault(
-            IPayable(payable(proxy)), rc, posm, permit2, key, address(refuser), TRIGGER, DEVIATION, COOLDOWN
-        );
+        ChaserVault v =
+            new ChaserVault(IPayable(payable(proxy)), rc, posm, permit2, key, address(refuser), DEVIATION, COOLDOWN);
         token1.mint(address(v), 3e18);
         vm.deal(makeAddr("stranger"), 1);
         vm.prank(makeAddr("stranger"));
         (bool ok,) = address(v).call{value: 1}("");
         assertTrue(ok);
         vm.prank(address(refuser));
-        v.withdraw();
+        v.withdraw(address(refuser));
         assertEq(token1.balanceOf(address(refuser)), 3e18);
         assertEq(address(v).balance, 1);
     }
 
-    function _open(uint128 amount0, uint128 amount1) internal {
-        token0.mint(owner, amount0);
-        token1.mint(owner, amount1);
-        (uint160 sqrtPrice,,,) = manager.getSlot0(key.toId());
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPrice, TickMath.getSqrtPriceAtTick(LOWER), TickMath.getSqrtPriceAtTick(UPPER), amount0, amount1
-        );
-        vm.startPrank(owner);
-        token0.approve(address(vault), amount0);
-        token1.approve(address(vault), amount1);
-        vault.open(LOWER, UPPER, liquidity, amount0, amount1);
-        vm.stopPrank();
+    function _forward(ChaserReactive reactive, Vm.Log[] memory logs) internal {
+        for (uint256 i; i < logs.length; i++) {
+            IReactive.LogRecord memory log_;
+            log_.chainId = block.chainid;
+            log_.contractAddress = logs[i].emitter;
+            log_.topic0 = uint256(logs[i].topics[0]);
+            if (logs[i].topics.length > 1) log_.topic1 = uint256(logs[i].topics[1]);
+            if (logs[i].topics.length > 2) log_.topic2 = uint256(logs[i].topics[2]);
+            if (logs[i].topics.length > 3) log_.topic3 = uint256(logs[i].topics[3]);
+            log_.data = logs[i].data;
+            vm.prank(0x8888888888888888888888888888888888888888);
+            reactive.react(log_);
+        }
     }
 
     /// The reactive contract confirmed the current tick; read it before the prank, which applies to the next call.
@@ -389,42 +420,18 @@ contract ChaserVaultForkTest is Test {
         vault.rebalance(rc, observedTick);
     }
 
-    function _moveTo(int24 target) internal {
-        bool zeroForOne = target < _tick();
-        swapper.swap(
-            key,
-            SwapParams(zeroForOne, -1e30, TickMath.getSqrtPriceAtTick(target)),
-            PoolSwapTest.TestSettings(false, false),
-            ""
-        );
-    }
-
-    function _tick() internal view returns (int24 tick) {
-        (, tick,,) = manager.getSlot0(key.toId());
-    }
-
-    function _amounts() internal view returns (uint256 amount0, uint256 amount1) {
-        (uint160 sqrtPrice,,,) = manager.getSlot0(key.toId());
-        (amount0, amount1) = LiquidityAmounts.getAmountsForLiquidity(
-            sqrtPrice,
-            TickMath.getSqrtPriceAtTick(vault.tickLower()),
-            TickMath.getSqrtPriceAtTick(vault.tickUpper()),
-            posm.getPositionLiquidity(vault.tokenId())
-        );
-    }
-
     function _held0() internal view returns (uint256) {
-        (uint256 amount0,) = _amounts();
+        (uint256 amount0,) = _amountsOf(vault);
         return amount0 + token0.balanceOf(address(vault));
     }
 
     function _held1() internal view returns (uint256) {
-        (, uint256 amount1) = _amounts();
+        (, uint256 amount1) = _amountsOf(vault);
         return amount1 + token1.balanceOf(address(vault));
     }
 
     function _assertSingleToken(bool onlyToken0) internal view {
-        (uint256 amount0, uint256 amount1) = _amounts();
+        (uint256 amount0, uint256 amount1) = _amountsOf(vault);
         if (onlyToken0) {
             assertGt(amount0, 0);
             assertEq(amount1, 0);
@@ -432,15 +439,6 @@ contract ChaserVaultForkTest is Test {
             assertEq(amount0, 0);
             assertGt(amount1, 0);
         }
-    }
-
-    function _fundAndApprove(address who, address spender, uint256 amount) internal {
-        if (amount > 0) {
-            token0.mint(who, amount);
-            token1.mint(who, amount);
-        }
-        token0.approve(spender, type(uint256).max);
-        token1.approve(spender, type(uint256).max);
     }
 }
 
