@@ -1,6 +1,7 @@
 {
   "name": "Base Sepolia",
   "chainId": 84532,
+  "testnet": true,
   "rpcUrl": "https://sepolia.base.org",
   "explorer": "https://sepolia.basescan.org",
   "uniswap": {
