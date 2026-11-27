@@ -39,6 +39,8 @@ contract Chaser is Script {
     }
 
     function pool() external {
+        _onDestination();
+        _testnetOnly();
         IPoolManager manager = IPositionManager(_addr(".uniswap.positionManager")).poolManager();
         vm.startBroadcast();
         TestToken a = new TestToken("Chaser Test A", "CTA", 18);
@@ -65,6 +67,7 @@ contract Chaser is Script {
     }
 
     function reactive() external {
+        _onReactive();
         PoolKey memory key = _poolKey();
         vm.startBroadcast();
         // funded as its own balance (not system reserves) so the owner can take what is left with withdrawFunds
@@ -83,6 +86,7 @@ contract Chaser is Script {
     }
 
     function factory(address rc) external {
+        _onDestination();
         ChaserFactory.PoolConfig[] memory pools = new ChaserFactory.PoolConfig[](1);
         pools[0] = ChaserFactory.PoolConfig({
             key: _poolKey(),
@@ -106,12 +110,15 @@ contract Chaser is Script {
     }
 
     function linkFactory(address rc, address f) external {
+        _onReactive();
         vm.startBroadcast();
         ChaserReactive(payable(rc)).setFactory(f);
         vm.stopBroadcast();
     }
 
     function create(address f) external {
+        _onDestination();
+        _testnetOnly();
         ChaserFactory cf = ChaserFactory(f);
         PoolKey memory key = _poolKey();
         (, int24 tick,,) = cf.poolManager().getSlot0(key.toId());
@@ -138,6 +145,20 @@ contract Chaser is Script {
             _int24(".chaser.params.tickSpacing"),
             IHooks(address(0))
         );
+    }
+
+    // the RPC must match the config file, so a crossed NETWORK and --rpc-url never deploys on the wrong chain
+    function _onDestination() internal view {
+        require(block.chainid == vm.parseJsonUint(cfg, ".chainId"), "rpc is not this network's chain");
+    }
+
+    function _onReactive() internal view {
+        require(block.chainid == vm.parseJsonUint(cfg, ".reactive.chainId"), "rpc is not this network's reactive chain");
+    }
+
+    // test tokens and test routers only exist on networks marked as testnet
+    function _testnetOnly() internal view {
+        require(vm.parseJsonBool(cfg, ".testnet"), "testnet-only step");
     }
 
     function _addr(string memory path) internal view returns (address) {

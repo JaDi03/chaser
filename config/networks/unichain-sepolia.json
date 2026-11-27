@@ -1,6 +1,7 @@
 {
   "name": "Unichain Sepolia",
   "chainId": 1301,
+  "testnet": true,
   "rpcUrl": "https://sepolia.unichain.org",
   "explorer": "https://sepolia.uniscan.xyz",
   "uniswap": {
@@ -17,8 +18,15 @@
     "callbackProxy": "0x775c9B990ADe401060B78D0e98684eEf8d2466C1"
   },
   "chaser": {
-    "factory": null,
-    "reactive": null,
+    "factory": "0x2588abA4D7a3cA6c705631c8Bc4BaF8C948b994C",
+    "reactive": "0xE636cF064317A72b080065C0A54774c0b4197D9e",
+    "demoVaults": [
+      "0x99b363F2266039dE15e8Ea89a7B9ee996aC649C7",
+      "0xD21636396603b2f83e7109aCfEfd9D1fEdb6fA2C",
+      "0x9037Cb533754A170C49Be4988DF8029af5B504E4",
+      "0x6345Fa442efEAC75B4f6669AD4718b5B69D65473",
+      "0x5E31996DC4756718d0EDC09C51FA42200932b3d5"
+    ],
     "pool": {
       "token0": "0xB44D2050E42ed0b153d349e7a20F68cf0a282553",
       "token1": "0xe92e0661AA346E48A44d2bA929cDE8c964A4Ae9f",
